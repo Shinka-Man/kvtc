@@ -644,7 +644,11 @@ class PatchedForward:
         if self.handle.auto_activate and not self.handle.active and pure_decode and self.handle.has_prefill_data():
             self.handle.free_kv_cache()
 
-        self.state.capture(key, value, spans)
+        # PATCH(lna-lab): when Attention.forward wrapper handles capture (vLLM 0.19+ V1
+        # workaround), skip capture here to avoid double-counting. Toggled via state flag
+        # set by _wrap_attention_forward_for_capture.
+        if not getattr(self.state, "_skip_patched_capture", False):
+            self.state.capture(key, value, spans)
 
         if not self.handle.active:
             return self.original(layer, query, key, value, kv_cache, attn_metadata, *args, **kwargs)
@@ -654,8 +658,17 @@ class PatchedForward:
 
         extra_kwargs = dict(kwargs)
         output = extra_kwargs.pop("output", args[0] if args else None)
+        # PATCH(lna-lab): vLLM 0.19+ unified_attention_with_output passes extra
+        # kwargs (output_scale, output_block_scale, ...) that we can safely
+        # ignore on the KVTC decode path because we synthesize the output tensor
+        # ourselves from the dequantized projection.
+        extra_kwargs.pop("output_scale", None)
+        extra_kwargs.pop("output_block_scale", None)
         if extra_kwargs or len(args) > 1:
-            raise RuntimeError("Unsupported vLLM attention signature on KVTC decode path.")
+            raise RuntimeError(
+                f"Unsupported vLLM attention signature on KVTC decode path: "
+                f"unexpected kwargs={list(extra_kwargs)}, extra_args={len(args) - 1}"
+            )
 
         output_tensor = output if output is not None else torch.empty_like(query)
         output_view = output_tensor.view_as(query) if output_tensor.dim() == 2 else output_tensor
@@ -740,6 +753,44 @@ def hook_model(
     return handle
 
 
+def _wrap_attention_forward_for_capture(layer: Any, state: "KVTCLayerState", handle: "KVTCHandle") -> None:
+    """PATCH(lna-lab): Install Attention.forward wrapper to capture prefill K/V.
+
+    vLLM 0.19 V1 routes prefill through ``torch.ops.vllm.unified_attention_with_output``
+    which dispatches via the C++ op registry. The dispatcher does NOT respect runtime
+    monkey-patches of ``self.impl.forward`` for prefill batches (only DECODE batches
+    re-resolve the attribute). To reliably capture prefill K/V we wrap
+    ``Attention.forward`` (the nn.Module method) directly.
+    """
+    from vllm.forward_context import get_forward_context
+
+    original_forward = layer.forward
+    state._skip_patched_capture = True  # tell PatchedForward to not double-capture
+
+    def patched_attention_forward(query, key, value, output_shape=None):
+        try:
+            fwd_ctx = get_forward_context()
+            attn_metadata = fwd_ctx.attn_metadata
+            if isinstance(attn_metadata, dict):
+                attn_metadata = attn_metadata.get(layer.layer_name, None)
+        except Exception:
+            attn_metadata = None
+
+        # Reshape K/V to [num_tokens, num_kv_heads, head_size] before capture; this
+        # matches the layout unified_attention_with_output passes to impl.forward.
+        num_tokens = query.shape[0]
+        k3d = key.view(-1, state.num_kv_heads, state.head_dim) if (key is not None and key.dim() == 2) else key
+        v3d = value.view(-1, state.num_kv_heads, state.head_dim) if (value is not None and value.dim() == 2) else value
+
+        if k3d is not None and v3d is not None:
+            spans = extract_request_spans(attn_metadata, num_tokens, device=k3d.device)
+            state.capture(k3d, v3d, spans)
+
+        return original_forward(query, key, value, output_shape=output_shape)
+
+    layer.forward = patched_attention_forward
+
+
 def free_kv_cache(model_or_handle: Any) -> KVTCHandle:
     """Finalize KVTC state and release vLLM's paged KV cache."""
 
@@ -753,6 +804,86 @@ def free_kv_cache(model_or_handle: Any) -> KVTCHandle:
     return handle
 
 
+# ---------------------------------------------------------------------------
+# vLLM 0.19+ child-process wrapper (Lna-Lab patch)
+# ---------------------------------------------------------------------------
+#
+# Since vLLM 0.18, LLMEngine spawns a separate EngineCore process; the model
+# nn.Module lives in that child. Direct hook_model(model) from the user-facing
+# process can no longer find attention layers. Instead, we route through
+# llm.llm_engine.apply_model(func) which executes ``func(model)`` inside the
+# EngineCore worker (requires VLLM_ALLOW_INSECURE_SERIALIZATION=1 because the
+# function is pickled across the IPC boundary).
+
+
+def _install_in_worker(calibration_bytes: bytes, auto_activate: bool, use_triton: bool):
+    """Closure executed inside the EngineCore worker process."""
+
+    def _install(model):
+        import io
+        import pickle
+        from kvtc.vllm_backend import hook_model, _wrap_attention_forward_for_capture
+        cal = pickle.load(io.BytesIO(calibration_bytes))
+        handle = hook_model(model, cal, auto_activate=auto_activate, use_triton=use_triton)
+        # Save handle on the model for later free_kv_cache_engine call.
+        model._kvtc_handle = handle
+        # PATCH(lna-lab): vLLM 0.19+ V1 routes prefill batches through a fast-path
+        # that bypasses runtime monkey-patches of ``impl.forward`` (only DECODE
+        # batches reach the patched method). To reliably capture prefill K/V we
+        # additionally wrap each Attention nn.Module ``forward``.
+        for pl in handle.patched_layers:
+            _wrap_attention_forward_for_capture(pl.layer, pl.state, handle)
+        return {
+            "num_layers": len(handle.patched_layers),
+            "auto_activate": auto_activate,
+            "use_triton": use_triton,
+        }
+
+    return _install
+
+
+def hook_engine(
+    llm: Any,
+    calibration_data: CalibrationData,
+    *,
+    auto_activate: bool = False,
+    use_triton: bool = True,
+) -> Dict[str, Any]:
+    """Install KVTC hooks on a vLLM 0.19+ ``LLM`` (apply_model RPC variant).
+
+    Requires ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` in the env so vLLM's
+    ZMQ encoder will pickle our installer function across the IPC boundary
+    to the EngineCore child process.
+
+    Returns a dict summary (workers' return values aggregated). The actual
+    :class:`KVTCHandle` lives inside the child process and is reachable from
+    user code only via further :func:`apply_model` calls (see
+    :func:`free_kv_cache_engine`).
+    """
+
+    import pickle
+    cal_bytes = pickle.dumps(calibration_data)
+    install = _install_in_worker(cal_bytes, auto_activate, use_triton)
+    results = llm.llm_engine.apply_model(install)
+    if results:
+        return results[0]  # uniproc / driver worker
+    return {"num_layers": 0}
+
+
+def free_kv_cache_engine(llm: Any) -> Dict[str, Any]:
+    """vLLM 0.19+ wrapper around :func:`free_kv_cache` via ``apply_model``."""
+
+    def _free(model):
+        from kvtc.vllm_backend import free_kv_cache
+        handle = free_kv_cache(model)
+        return {"freed_layers": len(handle.patched_layers)}
+
+    results = llm.llm_engine.apply_model(_free)
+    if results:
+        return results[0]
+    return {"freed_layers": 0}
+
+
 __all__ = [
     "KVTCLayerState",
     "KVTCHandle",
@@ -760,6 +891,8 @@ __all__ = [
     "PatchedForward",
     "extract_request_spans",
     "free_kv_cache",
+    "free_kv_cache_engine",
     "hook_model",
+    "hook_engine",
     "resolve_attention_layers",
 ]
