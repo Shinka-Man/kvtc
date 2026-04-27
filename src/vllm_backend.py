@@ -17,6 +17,13 @@ from .pca import apply_rope_inverse, pca_transform
 from .vllm_triton import decode_attention_from_kvtc, dense_attention_state, merge_attention_states
 
 
+def _apply_soft_cap_torch(scores: torch.Tensor, logits_soft_cap: float | None) -> torch.Tensor:
+    """Mirror of kvtc.vllm_triton._apply_soft_cap, but accepts the 0-as-disabled sentinel."""
+    if logits_soft_cap is None or logits_soft_cap <= 0:
+        return scores
+    return logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+
+
 NEG_INF = float("-inf")
 
 
@@ -547,24 +554,164 @@ class KVTCLayerState:
         """PATCH(lna-lab Phase α): causal-truncated multi-token decode.
 
         Like ``decode_request`` but only attends over state K/V at positions strictly
-        less than ``max_position_exclusive``. Used for spec-verify multi-token batches
-        where the j-th query token at sequence position p_j must not see K/V at
-        positions >= p_j + 1 (causal mask).
+        less than ``max_position_exclusive``. Used for spec-verify multi-token batches.
+        Phase β step 2a: per-head Python loop replaced with batched torch attention
+        (sinks + window dense in single matmul across all heads; middle range still
+        per-head until Triton kernel rewrite).
         """
         sequence = self.sequences.get(request_id)
         if sequence is None:
             raise KeyError(f"Layer {self.layer_idx} has no KVTC state for request {request_id}.")
+        return self._decode_all_heads(sequence, query, max_position_exclusive=max_position_exclusive)
 
-        output = torch.empty_like(query)
-        for head_idx in range(self.num_heads):
-            kv_head_idx = min(head_idx // self.queries_per_kv, self.num_kv_heads - 1)
-            group_idx = kv_head_idx // self.head_group_size
-            local_head_idx = kv_head_idx - self.groups[group_idx].head_indices[0]
-            output[head_idx] = self._decode_one_head(
-                sequence, self.groups[group_idx], kv_head_idx, local_head_idx,
-                query[head_idx], max_position_exclusive=max_position_exclusive,
-            )
-        return output
+    def _decode_all_heads(
+        self,
+        sequence: KVTCSequenceState,
+        query: torch.Tensor,
+        max_position_exclusive: int | None = None,
+    ) -> torch.Tensor:
+        """PATCH(lna-lab Phase β step 2a): batched all-heads attention for one query token.
+
+        ``query`` shape: ``[num_heads, head_dim]``. Returns ``[num_heads, head_dim]``.
+
+        - Sinks + window: a single dense torch attention across all heads
+          (avoids the 24× Python loop per layer per call).
+        - Middle (PCA-compressed): still iterates per group (4 groups for Qwen3.6-27B)
+          since the existing decode_attention_from_kvtc Triton kernel is per-head;
+          but inside each group the queries-per-kv (6 for Qwen3.6) are batched.
+        """
+        device = query.device
+        dtype = query.dtype
+        # Per-head expanded indices: which kv_head each query head reads from.
+        # E.g. Qwen3.6-27B num_heads=24 num_kv_heads=4 queries_per_kv=6
+        # → kv_head_lookup = [0,0,0,0,0,0,1,1,1,1,1,1,2,2,2,2,2,2,3,3,3,3,3,3]
+        kv_head_lookup = torch.arange(self.num_heads, device=device) // self.queries_per_kv
+        kv_head_lookup = kv_head_lookup.clamp_max(self.num_kv_heads - 1)
+
+        merged_output = torch.zeros(self.num_heads, self.head_dim, device=device, dtype=dtype)
+        merged_lse = torch.full((self.num_heads,), NEG_INF, device=device, dtype=torch.float32)
+
+        # Sinks (positions 0..sink_len-1) and Window (positions [middle_end..total-1]).
+        for region_keys, region_vals, region_pos in self._iter_dense_regions(
+            sequence, max_position_exclusive
+        ):
+            # region_keys / region_vals shape: [N, num_kv_heads, head_dim]
+            if region_keys.numel() == 0:
+                continue
+            keys_per_head = region_keys.index_select(1, kv_head_lookup).to(dtype)   # [N, num_heads, head_dim]
+            vals_per_head = region_vals.index_select(1, kv_head_lookup).to(dtype)   # [N, num_heads, head_dim]
+            # scores[n, h] = (keys[n,h,:] · query[h,:]) * scale
+            scores = torch.einsum("nhd,hd->nh", keys_per_head.float(), query.float()) * self.softmax_scale
+            scores = _apply_soft_cap_torch(scores, self.logits_soft_cap)
+            lse = torch.logsumexp(scores, dim=0)            # [num_heads]
+            weights = torch.softmax(scores, dim=0)          # [N, num_heads]
+            region_out = torch.einsum("nh,nhd->hd", weights, vals_per_head.float()).to(dtype)
+            merged_output, merged_lse = self._merge_states(merged_output, merged_lse, region_out, lse)
+
+        # Middle (compressed). Still per-group; each group amortizes dequant across its
+        # queries-per-kv heads (6 for Qwen3.6-27B). Could be further batched in Phase β
+        # step 2b/c with a dedicated multi-head Triton kernel.
+        middle_positions = sequence.middle_positions
+        if middle_positions is not None and middle_positions.numel() > 0:
+            mid_pos = middle_positions
+            mid_mask = None
+            if max_position_exclusive is not None:
+                mid_mask = mid_pos < max_position_exclusive
+                if mid_mask.all():
+                    mid_mask = None
+                else:
+                    mid_pos = mid_pos[mid_mask]
+            if mid_pos.numel() > 0:
+                for group_idx, group in self.groups.items():
+                    storage = sequence.compressed.get(group_idx)
+                    if storage is None or storage.key_indices is None or storage.key_indices.shape[0] == 0:
+                        continue
+                    key_idx = storage.key_indices
+                    val_idx = storage.value_indices
+                    if mid_mask is not None:
+                        key_idx = key_idx[mid_mask]
+                        val_idx = val_idx[mid_mask]
+                    # Within a group, iterate per kv_head (head_group_size=1 means one
+                    # kv_head per group; the queries_per_kv batching is handled by
+                    # _attend_compressed_for_kv_head which serves all matching query heads).
+                    for local_head_idx, kv_head_idx in enumerate(group.head_indices):
+                        # Find which query heads use this kv_head
+                        q_mask = (kv_head_lookup == kv_head_idx)
+                        if not q_mask.any():
+                            continue
+                        q_head_indices = q_mask.nonzero(as_tuple=False).flatten()
+                        for qh in q_head_indices.tolist():
+                            mid_out, mid_lse = decode_attention_from_kvtc(
+                                query[qh],
+                                key_idx[:, local_head_idx, :].to(device=device),
+                                val_idx[:, local_head_idx, :].to(device=device),
+                                group.key.scales.to(device=device),
+                                group.key.zero_points.to(device=device),
+                                group.value.scales.to(device=device),
+                                group.value.zero_points.to(device=device),
+                                group.key.basis_t.to(device=device),
+                                group.value.basis_t.to(device=device),
+                                group.key.mean.to(device=device),
+                                group.value.mean.to(device=device),
+                                mid_pos.to(device=device),
+                                rope_theta=self.rope_theta,
+                                softmax_scale=self.softmax_scale,
+                                logits_soft_cap=self.logits_soft_cap,
+                                use_triton=self.use_triton,
+                            )
+                            cur_out = merged_output[qh]
+                            cur_lse = merged_lse[qh]
+                            new_out, new_lse = merge_attention_states(
+                                cur_out, cur_lse, mid_out.to(dtype), mid_lse,
+                            )
+                            merged_output[qh] = new_out
+                            merged_lse[qh] = new_lse
+
+        return merged_output
+
+    def _iter_dense_regions(self, sequence: KVTCSequenceState, max_position_exclusive: int | None):
+        """Yield (keys, values, positions) for sinks and window, applying causal mask."""
+        # Sinks: positions 0..sink_len-1 (implicit ordering).
+        if sequence.sinks_keys is not None and sequence.sinks_keys.numel():
+            sk = sequence.sinks_keys
+            sv = sequence.sinks_values
+            if max_position_exclusive is not None and max_position_exclusive < sk.shape[0]:
+                sk = sk[:max_position_exclusive]
+                sv = sv[:max_position_exclusive]
+            if sk.numel():
+                yield sk, sv, None
+        # Window
+        if sequence.window_keys is not None and sequence.window_keys.numel():
+            wk = sequence.window_keys
+            wv = sequence.window_values
+            if max_position_exclusive is not None and sequence.window_positions is not None:
+                mask = sequence.window_positions < max_position_exclusive
+                if not mask.all():
+                    wk = wk[mask]
+                    wv = wv[mask]
+            if wk.numel():
+                yield wk, wv, None
+
+    @staticmethod
+    def _merge_states(left_out, left_lse, right_out, right_lse):
+        """Vectorized log-sum-exp merge across heads (input shapes [num_heads, head_dim] / [num_heads])."""
+        is_left_neg = torch.isneginf(left_lse)
+        is_right_neg = torch.isneginf(right_lse)
+        # Where left is -inf: take right; where right is -inf: take left; else merge.
+        max_lse = torch.maximum(left_lse, right_lse)
+        left_w = torch.exp(left_lse - max_lse)
+        right_w = torch.exp(right_lse - max_lse)
+        left_w = torch.where(is_left_neg, torch.zeros_like(left_w), left_w)
+        right_w = torch.where(is_right_neg, torch.zeros_like(right_w), right_w)
+        denom = left_w + right_w
+        # Avoid div-by-zero where both are -inf
+        denom_safe = torch.where(denom == 0, torch.ones_like(denom), denom)
+        merged = (left_out * left_w.unsqueeze(-1) + right_out * right_w.unsqueeze(-1)) / denom_safe.unsqueeze(-1)
+        merged_lse = max_lse + torch.log(denom_safe)
+        # Where both -inf, keep -inf
+        both_neg = is_left_neg & is_right_neg
+        merged_lse = torch.where(both_neg, left_lse, merged_lse)
+        return merged, merged_lse
 
     def _decode_one_head(
         self,
