@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from common import QuantizationParams
+from .common import QuantizationParams
 
 
 def greedy_bit_allocation(

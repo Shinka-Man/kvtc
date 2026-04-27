@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 from typing import Tuple
 
-from common import PCAEntry, QuantizationParams
+from .common import PCAEntry, QuantizationParams
 
 
 def fused_pca_quantize(

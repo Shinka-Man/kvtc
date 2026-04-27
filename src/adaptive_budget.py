@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple
 
-from common import CalibrationData, PCAEntry
+from .common import CalibrationData, PCAEntry
 
 
 def compute_layer_difficulty(calibration: CalibrationData) -> Tuple[np.ndarray, np.ndarray]:
