@@ -515,7 +515,13 @@ class KVTCLayerState:
             )
         rows = work.reshape(tokens * group_heads, self.head_dim).to(torch.float32)
         centered = rows - spec.mean.to(device=rows.device, dtype=rows.dtype)
-        pca_values = pca_transform(centered, spec.projection_basis.to(device=rows.device, dtype=rows.dtype))
+        # PATCH(lna-lab): pass basis_t (shape [k, dim]) so that pca_transform's
+        # `.T` produces [dim, k] for the matmul. spec.projection_basis is stored
+        # with shape [dim, k] (column-selected from full eigenvectors) which
+        # collapses correctly when k == dim (no zero bit_widths) but breaks for
+        # rank-reduced calibrations like Qwen3.6-27B head_dim=256 with 4
+        # zero-bit components → 252 active.
+        pca_values = pca_transform(centered, spec.basis_t.to(device=rows.device, dtype=rows.dtype))
         indices = batch_quantize(
             pca_values,
             spec.bit_widths.to(device=rows.device),
@@ -726,8 +732,18 @@ def hook_model(
     """Patch vLLM attention layers so decode reads from KVTC state."""
 
     patched_layers: List[PatchedLayer] = []
-    for fallback_idx, (prefix, layer) in enumerate(resolve_attention_layers(model)):
-        layer_idx = _parse_layer_idx(prefix, fallback_idx)
+    resolved = resolve_attention_layers(model)
+    # PATCH(lna-lab): for hybrid attention models (e.g. Qwen3.6 / Qwen3-Next /
+    # Mamba-mixed) only the *full_attention* layers carry KV state and end up in
+    # ``static_forward_context``. Their prefixes parse to sparse indices like
+    # 3, 7, 11, ..., 63 — but our calibration is built with a *contiguous*
+    # remap (kvtc/calibrate.py iterates past_key_values.layers and skips KV-less
+    # layers, indexing 0..N-1). So when the resolved set is sparse we use the
+    # iteration position as ``layer_idx`` to keep the two sides symmetric.
+    parsed_indices = [_parse_layer_idx(prefix, i) for i, (prefix, _) in enumerate(resolved)]
+    is_sparse = parsed_indices != list(range(len(resolved)))
+    for fallback_idx, (prefix, layer) in enumerate(resolved):
+        layer_idx = fallback_idx if is_sparse else _parse_layer_idx(prefix, fallback_idx)
         impl = layer.impl
         patched_layers.append(
             PatchedLayer(
