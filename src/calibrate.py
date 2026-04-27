@@ -44,9 +44,14 @@ class KVTCCalibrator:
             # Handle DynamicCache (.layers), legacy DynamicCache (.key_cache), and tuple formats
             if hasattr(past, 'layers'):
                 # Newest transformers DynamicCache with .layers[i].keys/.values
-                for layer_idx, layer in enumerate(past.layers):
-                    self._pca.collect(layer_idx, "keys", layer.keys[0].transpose(0, 1).detach().cpu(), positions.cpu())
-                    self._pca.collect(layer_idx, "values", layer.values[0].transpose(0, 1).detach().cpu())
+                # PATCH(lna-lab): hybrid attention support — contiguous index for full-attn layers
+                contig_idx = 0
+                for layer in past.layers:
+                    if not hasattr(layer, 'keys') or layer.keys is None:
+                        continue  # skip linear/mamba layers (no KV cache)
+                    self._pca.collect(contig_idx, "keys", layer.keys[0].transpose(0, 1).detach().cpu(), positions.cpu())
+                    self._pca.collect(contig_idx, "values", layer.values[0].transpose(0, 1).detach().cpu())
+                    contig_idx += 1
             elif hasattr(past, 'key_cache'):
                 # Older DynamicCache with .key_cache/.value_cache lists
                 for layer_idx in range(len(past.key_cache)):
