@@ -388,7 +388,17 @@ def _decode_attention_triton(
         return _empty_state(head_dim, device=query.device, dtype=query.dtype)
 
     if head_dim > 128:
+        # PATCH(lna-lab Phase β): the original kernel hardcoded BLOCK_D=128 and uses
+        # PyTorch-style slicing (key_vectors[:, 0::2]) for RoPE, which doesn't expand
+        # cleanly to BLOCK_D=256 in Triton 3.6 ("Cannot make_shape_compatible"). For
+        # head_dim>128 we fall back to torch until Phase β step 2 rewrites the kernel.
         raise ValueError("The reference Triton kernel supports head dimensions up to 128.")
+
+    block_t = 64
+    block_d = 128
+    block_ck = 128
+    block_cv = 128
+    num_blocks = math.ceil(seq_len / block_t)
 
     cos, sin = _rope_cos_sin(
         positions,
@@ -396,8 +406,6 @@ def _decode_attention_triton(
         rope_theta,
         device=query.device,
     )
-    block_t = 64
-    num_blocks = math.ceil(seq_len / block_t)
     block_outputs = torch.empty(
         (num_blocks, head_dim),
         device=query.device,
@@ -439,9 +447,9 @@ def _decode_attention_triton(
         block_outputs.stride(0),
         block_outputs.stride(1),
         BLOCK_T=block_t,
-        BLOCK_D=128,
-        BLOCK_CK=128,
-        BLOCK_CV=128,
+        BLOCK_D=block_d,
+        BLOCK_CK=block_ck,
+        BLOCK_CV=block_cv,
     )
 
     merged_output, merged_lse = _empty_state(
@@ -480,13 +488,18 @@ def decode_attention_from_kvtc(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode attention over one compressed chunk for one query head."""
 
+    # PATCH(lna-lab Phase β): treat soft_cap=0 same as None (Qwen3.6/LNARIZE pass 0
+    # as a "disabled" sentinel; the original strict-None check silently routed those
+    # models through the slow torch fallback). head_dim and component caps stay at 128
+    # until Phase β step 2 rewrites the kernel to handle BLOCK_D=256 / Qwen3.6-27B.
+    soft_cap_disabled = (logits_soft_cap is None) or (logits_soft_cap == 0)
     if (
         use_triton
         and HAS_TRITON
         and query.is_cuda
         and key_indices.is_cuda
         and value_indices.is_cuda
-        and logits_soft_cap is None
+        and soft_cap_disabled
         and int(query.shape[-1]) <= 128
         and int(key_indices.shape[-1]) <= 128
         and int(value_indices.shape[-1]) <= 128
