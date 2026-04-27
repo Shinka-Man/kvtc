@@ -608,9 +608,10 @@ class KVTCLayerState:
             region_out = torch.einsum("nh,nhd->hd", weights, vals_per_head.float()).to(dtype)
             merged_output, merged_lse = self._merge_states(merged_output, merged_lse, region_out, lse)
 
-        # Middle (compressed). Still per-group; each group amortizes dequant across its
-        # queries-per-kv heads (6 for Qwen3.6-27B). Could be further batched in Phase β
-        # step 2b/c with a dedicated multi-head Triton kernel.
+        # Middle (compressed). PATCH(lna-lab Phase β step 2b): per-group, dequantize
+        # K/V *once* and batch attention across the queries_per_kv query heads sharing
+        # the same kv_head (6 heads for Qwen3.6-27B). Saves the redundant per-head
+        # PCA inverse + RoPE-undo work.
         middle_positions = sequence.middle_positions
         if middle_positions is not None and middle_positions.numel() > 0:
             mid_pos = middle_positions
@@ -631,43 +632,58 @@ class KVTCLayerState:
                     if mid_mask is not None:
                         key_idx = key_idx[mid_mask]
                         val_idx = val_idx[mid_mask]
-                    # Within a group, iterate per kv_head (head_group_size=1 means one
-                    # kv_head per group; the queries_per_kv batching is handled by
-                    # _attend_compressed_for_kv_head which serves all matching query heads).
                     for local_head_idx, kv_head_idx in enumerate(group.head_indices):
-                        # Find which query heads use this kv_head
                         q_mask = (kv_head_lookup == kv_head_idx)
                         if not q_mask.any():
                             continue
                         q_head_indices = q_mask.nonzero(as_tuple=False).flatten()
-                        for qh in q_head_indices.tolist():
-                            mid_out, mid_lse = decode_attention_from_kvtc(
-                                query[qh],
-                                key_idx[:, local_head_idx, :].to(device=device),
-                                val_idx[:, local_head_idx, :].to(device=device),
-                                group.key.scales.to(device=device),
-                                group.key.zero_points.to(device=device),
-                                group.value.scales.to(device=device),
-                                group.value.zero_points.to(device=device),
-                                group.key.basis_t.to(device=device),
-                                group.value.basis_t.to(device=device),
-                                group.key.mean.to(device=device),
-                                group.value.mean.to(device=device),
-                                mid_pos.to(device=device),
-                                rope_theta=self.rope_theta,
-                                softmax_scale=self.softmax_scale,
-                                logits_soft_cap=self.logits_soft_cap,
-                                use_triton=self.use_triton,
-                            )
+                        # Dequantize K/V once for this kv_head (shared across all
+                        # query heads in q_head_indices).
+                        K_recon, V_recon = self._reconstruct_kv_for_kv_head(
+                            group, key_idx[:, local_head_idx, :], val_idx[:, local_head_idx, :],
+                            mid_pos, device,
+                        )  # [N, head_dim]
+                        # Batched attention across the (up to queries_per_kv) heads.
+                        q_batch = query[q_head_indices].float()           # [Hq, head_dim]
+                        scores = (K_recon @ q_batch.T) * self.softmax_scale  # [N, Hq]
+                        scores = _apply_soft_cap_torch(scores, self.logits_soft_cap)
+                        lse = torch.logsumexp(scores, dim=0)              # [Hq]
+                        weights = torch.softmax(scores, dim=0)            # [N, Hq]
+                        mid_out = (V_recon.T @ weights).T.to(dtype)        # [Hq, head_dim]
+                        # Merge into per-head accumulators.
+                        for k, qh in enumerate(q_head_indices.tolist()):
                             cur_out = merged_output[qh]
                             cur_lse = merged_lse[qh]
                             new_out, new_lse = merge_attention_states(
-                                cur_out, cur_lse, mid_out.to(dtype), mid_lse,
+                                cur_out, cur_lse, mid_out[k], lse[k],
                             )
                             merged_output[qh] = new_out
                             merged_lse[qh] = new_lse
 
         return merged_output
+
+    def _reconstruct_kv_for_kv_head(
+        self, group, key_idx_one_head: torch.Tensor, val_idx_one_head: torch.Tensor,
+        positions: torch.Tensor, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """PATCH(lna-lab Phase β step 2b): dequantize compressed K/V to ``[N, head_dim]``
+        for one kv_head, applying the position-dependent RoPE rotation.
+
+        K is undo-RoPE'd at compression time; here we re-apply RoPE using ``positions``.
+        V has no RoPE.
+        """
+        # Dequantize indices → PCA coefficients → reconstruct via basis_t.
+        key_dq = (key_idx_one_head.float() - group.key.zero_points.to(device).float()) * group.key.scales.to(device).float()
+        val_dq = (val_idx_one_head.float() - group.value.zero_points.to(device).float()) * group.value.scales.to(device).float()
+        # basis_t shape [k, head_dim]; pca @ basis_t gives back to head_dim space.
+        K_recon_pre_rope = key_dq @ group.key.basis_t.to(device).float() + group.key.mean.to(device).float()
+        V_recon = val_dq @ group.value.basis_t.to(device).float() + group.value.mean.to(device).float()
+        # Apply RoPE to keys (kvtc.pca exports it as ``apply_rope``).
+        from .pca import apply_rope
+        K_recon = apply_rope(
+            K_recon_pre_rope, positions.to(device), rope_theta=self.rope_theta, head_dim=self.head_dim,
+        )
+        return K_recon, V_recon
 
     def _iter_dense_regions(self, sequence: KVTCSequenceState, max_position_exclusive: int | None):
         """Yield (keys, values, positions) for sinks and window, applying causal mask."""
