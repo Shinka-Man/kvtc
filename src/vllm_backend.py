@@ -543,6 +543,29 @@ class KVTCLayerState:
             output[head_idx] = self._decode_one_head(sequence, self.groups[group_idx], kv_head_idx, local_head_idx, query[head_idx])
         return output
 
+    def decode_request_at(self, request_id: str, query: torch.Tensor, max_position_exclusive: int) -> torch.Tensor:
+        """PATCH(lna-lab Phase α): causal-truncated multi-token decode.
+
+        Like ``decode_request`` but only attends over state K/V at positions strictly
+        less than ``max_position_exclusive``. Used for spec-verify multi-token batches
+        where the j-th query token at sequence position p_j must not see K/V at
+        positions >= p_j + 1 (causal mask).
+        """
+        sequence = self.sequences.get(request_id)
+        if sequence is None:
+            raise KeyError(f"Layer {self.layer_idx} has no KVTC state for request {request_id}.")
+
+        output = torch.empty_like(query)
+        for head_idx in range(self.num_heads):
+            kv_head_idx = min(head_idx // self.queries_per_kv, self.num_kv_heads - 1)
+            group_idx = kv_head_idx // self.head_group_size
+            local_head_idx = kv_head_idx - self.groups[group_idx].head_indices[0]
+            output[head_idx] = self._decode_one_head(
+                sequence, self.groups[group_idx], kv_head_idx, local_head_idx,
+                query[head_idx], max_position_exclusive=max_position_exclusive,
+            )
+        return output
+
     def _decode_one_head(
         self,
         sequence: KVTCSequenceState,
@@ -550,21 +573,31 @@ class KVTCLayerState:
         kv_head_idx: int,
         local_head_idx: int,
         query: torch.Tensor,
+        max_position_exclusive: int | None = None,
     ) -> torch.Tensor:
         device = query.device
         merged_output = torch.zeros(self.head_dim, device=device, dtype=query.dtype)
         merged_lse = torch.tensor(NEG_INF, device=device, dtype=torch.float32)
 
+        # Sinks: positions 0..sink_len-1 (implicit). For causal mask with P, take
+        # only positions < P (i.e. up to min(sink_len, P) tokens).
         if sequence.sinks_keys is not None and sequence.sinks_keys.numel():
-            sink_output, sink_lse = dense_attention_state(
-                query,
-                sequence.sinks_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
-                sequence.sinks_values[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
-                softmax_scale=self.softmax_scale,
-                logits_soft_cap=self.logits_soft_cap,
-            )
-            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, sink_output, sink_lse)
+            sk_keys = sequence.sinks_keys
+            sk_vals = sequence.sinks_values
+            if max_position_exclusive is not None and max_position_exclusive < sk_keys.shape[0]:
+                sk_keys = sk_keys[:max_position_exclusive]
+                sk_vals = sk_vals[:max_position_exclusive]
+            if sk_keys.numel():
+                sink_output, sink_lse = dense_attention_state(
+                    query,
+                    sk_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                    sk_vals[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                    softmax_scale=self.softmax_scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+                merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, sink_output, sink_lse)
 
+        # Middle (compressed): filter via middle_positions < P.
         storage = sequence.compressed.get(group.group_idx)
         middle_positions = sequence.middle_positions
         if (
@@ -574,35 +607,56 @@ class KVTCLayerState:
             and middle_positions is not None
             and storage.key_indices.shape[0] > 0
         ):
-            middle_output, middle_lse = decode_attention_from_kvtc(
-                query,
-                storage.key_indices[:, local_head_idx, :].to(device=device),
-                storage.value_indices[:, local_head_idx, :].to(device=device),
-                group.key.scales.to(device=device),
-                group.key.zero_points.to(device=device),
-                group.value.scales.to(device=device),
-                group.value.zero_points.to(device=device),
-                group.key.basis_t.to(device=device),
-                group.value.basis_t.to(device=device),
-                group.key.mean.to(device=device),
-                group.value.mean.to(device=device),
-                middle_positions.to(device=device),
-                rope_theta=self.rope_theta,
-                softmax_scale=self.softmax_scale,
-                logits_soft_cap=self.logits_soft_cap,
-                use_triton=self.use_triton,
-            )
-            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, middle_output, middle_lse)
+            mid_key_idx = storage.key_indices
+            mid_val_idx = storage.value_indices
+            mid_pos = middle_positions
+            if max_position_exclusive is not None:
+                mask = mid_pos < max_position_exclusive
+                if mask.all():
+                    pass
+                else:
+                    mid_key_idx = mid_key_idx[mask]
+                    mid_val_idx = mid_val_idx[mask]
+                    mid_pos = mid_pos[mask]
+            if mid_key_idx.shape[0] > 0:
+                middle_output, middle_lse = decode_attention_from_kvtc(
+                    query,
+                    mid_key_idx[:, local_head_idx, :].to(device=device),
+                    mid_val_idx[:, local_head_idx, :].to(device=device),
+                    group.key.scales.to(device=device),
+                    group.key.zero_points.to(device=device),
+                    group.value.scales.to(device=device),
+                    group.value.zero_points.to(device=device),
+                    group.key.basis_t.to(device=device),
+                    group.value.basis_t.to(device=device),
+                    group.key.mean.to(device=device),
+                    group.value.mean.to(device=device),
+                    mid_pos.to(device=device),
+                    rope_theta=self.rope_theta,
+                    softmax_scale=self.softmax_scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                    use_triton=self.use_triton,
+                )
+                merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, middle_output, middle_lse)
 
+        # Window: filter via window_positions < P.
         if sequence.window_keys is not None and sequence.window_keys.numel():
-            window_output, window_lse = dense_attention_state(
-                query,
-                sequence.window_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
-                sequence.window_values[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
-                softmax_scale=self.softmax_scale,
-                logits_soft_cap=self.logits_soft_cap,
-            )
-            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, window_output, window_lse)
+            w_keys = sequence.window_keys
+            w_vals = sequence.window_values
+            if max_position_exclusive is not None and sequence.window_positions is not None:
+                mask = sequence.window_positions < max_position_exclusive
+                if not mask.all():
+                    w_keys = w_keys[mask]
+                    w_vals = w_vals[mask]
+            if w_keys.numel():
+                window_output, window_lse = dense_attention_state(
+                    query,
+                    w_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                    w_vals[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                    softmax_scale=self.softmax_scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+                merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, window_output, window_lse)
 
         return merged_output
 
@@ -770,18 +824,34 @@ def hook_model(
 
 
 def _wrap_attention_forward_for_capture(layer: Any, state: "KVTCLayerState", handle: "KVTCHandle") -> None:
-    """PATCH(lna-lab): Install Attention.forward wrapper to capture prefill K/V.
+    """PATCH(lna-lab Phase α): Install Attention.forward wrapper for capture + multi-token decode.
 
-    vLLM 0.19 V1 routes prefill through ``torch.ops.vllm.unified_attention_with_output``
-    which dispatches via the C++ op registry. The dispatcher does NOT respect runtime
-    monkey-patches of ``self.impl.forward`` for prefill batches (only DECODE batches
-    re-resolve the attribute). To reliably capture prefill K/V we wrap
-    ``Attention.forward`` (the nn.Module method) directly.
+    vLLM 0.19 V1 routes prefill (and spec-verify multi-token batches) through
+    ``torch.ops.vllm.unified_attention_with_output`` whose dispatcher does NOT honour
+    runtime monkey-patches of ``self.impl.forward`` for those batches (only the
+    single-token decode path reaches the patched method). So:
+
+    - **prefill** never reaches ``PatchedForward``                  (Phase B/C finding)
+    - **MTP/DFlash spec verify** (M=2..5 query tokens) never reaches ``PatchedForward``,
+      AND ``pure_decode and has_prefill_data`` is never true → ``auto_activate`` never
+      triggers → KVTC effectively stays inactive                    (Phase D finding)
+
+    This wrapper handles both:
+
+    1. Capture: every call's K/V is appended to ``state`` (handles prefill, verify,
+       and post-activation single decode).
+    2. Activation: the first multi-token "verify-shaped" call (i.e., query_len > 1
+       AND seq_len > query_len, meaning prior cached context exists) explicitly
+       triggers ``handle.free_kv_cache()`` so subsequent decodes go through KVTC.
+    3. Decode replacement: when ``handle.active``, the wrapper computes attention
+       output via ``state.decode_request`` for each query token (with causal mask
+       implicit in the per-token state slice), and returns that instead of calling
+       through to ``original_forward`` (which would attend over the dummy cache).
     """
     from vllm.forward_context import get_forward_context
 
     original_forward = layer.forward
-    state._skip_patched_capture = True  # tell PatchedForward to not double-capture
+    state._skip_patched_capture = True  # PatchedForward will not double-capture
 
     def patched_attention_forward(query, key, value, output_shape=None):
         try:
@@ -792,19 +862,86 @@ def _wrap_attention_forward_for_capture(layer: Any, state: "KVTCLayerState", han
         except Exception:
             attn_metadata = None
 
-        # Reshape K/V to [num_tokens, num_kv_heads, head_size] before capture; this
-        # matches the layout unified_attention_with_output passes to impl.forward.
         num_tokens = query.shape[0]
+        # K/V come in 2D as [num_tokens, num_kv_heads * head_dim]; reshape to 3D.
         k3d = key.view(-1, state.num_kv_heads, state.head_dim) if (key is not None and key.dim() == 2) else key
         v3d = value.view(-1, state.num_kv_heads, state.head_dim) if (value is not None and value.dim() == 2) else value
 
+        spans = []
         if k3d is not None and v3d is not None:
             spans = extract_request_spans(attn_metadata, num_tokens, device=k3d.device)
             state.capture(k3d, v3d, spans)
 
+        # "decode-or-verify shaped" = prior cached context exists (single-token decode
+        # OR multi-token spec verify); not a fresh prefill batch.
+        max_query_len = max((s.query_len for s in spans), default=0)
+        max_seq_len = max((s.seq_len for s in spans), default=0)
+        is_decode_or_verify = (max_query_len >= 1) and (max_seq_len > max_query_len)
+
+        # Activation trigger: first decode-or-verify call after capture has prefill data.
+        # For single-token decode this matches the original PatchedForward trigger; for
+        # spec verify (M=2..5) it is the only way activation fires under vLLM 0.19 V1
+        # because the verify path bypasses ``impl.forward`` and never reports pure_decode.
+        if (handle.auto_activate and not handle.active
+                and is_decode_or_verify and handle.has_prefill_data()):
+            handle.free_kv_cache()
+
+        # Active KVTC path: compute output ourselves, replace original_forward.
+        if handle.active and is_decode_or_verify and spans:
+            return _kvtc_compute_attention(
+                state, query, k3d, v3d, spans, num_tokens, output_shape, layer
+            )
+
         return original_forward(query, key, value, output_shape=output_shape)
 
     layer.forward = patched_attention_forward
+
+
+def _kvtc_compute_attention(
+    state: "KVTCLayerState",
+    query: torch.Tensor,
+    k3d: torch.Tensor,
+    v3d: torch.Tensor,
+    spans: List["RequestSpan"],
+    num_tokens: int,
+    output_shape: Any,
+    layer: Any,
+) -> torch.Tensor:
+    """Compute attention via KVTC for the M query tokens of one Attention.forward call.
+
+    Each query token at sequence position p attends over the per-request KVTC state
+    truncated to positions < p (causal). Result is reshaped back to the 2D
+    ``[num_tokens, num_heads * head_dim]`` layout vLLM's ``Attention.forward`` returns.
+    """
+    # Reshape query to [num_tokens, num_heads, head_dim].
+    if query.dim() == 2:
+        q3d = query.view(num_tokens, state.num_heads, state.head_dim)
+    else:
+        q3d = query
+
+    out_3d = torch.empty(
+        (num_tokens, state.num_heads, state.head_dim),
+        device=q3d.device,
+        dtype=q3d.dtype,
+    )
+
+    for span in spans:
+        # Per-token: causal slice of state. We rely on the fact that this call's
+        # tokens were just appended to state at positions [seq_len-query_len .. seq_len-1].
+        # For each query token i (relative to span), attend over state truncated at
+        # absolute position seq_len - query_len + i (exclusive upper bound).
+        for i in range(span.query_len):
+            global_pos = span.seq_len - span.query_len + i
+            tok_idx = span.start + i
+            # decode_one_token_at_position computes attention over the per-request
+            # state truncated to positions < global_pos.
+            decoded = state.decode_request_at(span.request_id, q3d[tok_idx], global_pos)
+            out_3d[tok_idx] = decoded
+
+    # Reshape back to vLLM's 2D output layout.
+    hidden = state.num_heads * state.head_dim
+    result = out_3d.reshape(num_tokens, hidden)
+    return result
 
 
 def free_kv_cache(model_or_handle: Any) -> KVTCHandle:

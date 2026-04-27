@@ -122,6 +122,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-triton", action="store_true")
     parser.add_argument("--auto-activate", action="store_true",
                         help="Activate KVTC decode path after prefill (default: passthrough).")
+    parser.add_argument("--language-model-only", action="store_true",
+                        help="For VLM-class models (e.g. Qwen3_5ForConditionalGeneration), "
+                             "skip the multimodal preprocessor.")
+    parser.add_argument("--quantization", default=None,
+                        help="vLLM quantization arg (e.g. modelopt for NVFP4).")
+    parser.add_argument("--speculative-config", default=None,
+                        help="vLLM speculative-config JSON (e.g. for MTP draft head).")
     parser.add_argument("--output-json", default="")
     return parser
 
@@ -143,7 +150,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             self.free_timestamp = None
             self.num_layers = int(self.info.get("num_layers", 0))
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         trust_remote_code=True,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -153,6 +160,13 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         async_scheduling=False,
         enable_prefix_caching=False,
     )
+    if getattr(args, "language_model_only", False):
+        llm_kwargs["language_model_only"] = True
+    if getattr(args, "quantization", None):
+        llm_kwargs["quantization"] = args.quantization
+    if getattr(args, "speculative_config", None):
+        llm_kwargs["speculative_config"] = json.loads(args.speculative_config)
+    llm = LLM(**llm_kwargs)
 
     sampling_params = SamplingParams(
         temperature=args.temperature,
