@@ -551,18 +551,39 @@ class KVTCLayerState:
         return output
 
     def decode_request_at(self, request_id: str, query: torch.Tensor, max_position_exclusive: int) -> torch.Tensor:
-        """PATCH(lna-lab Phase α): causal-truncated multi-token decode.
+        """PATCH(lna-lab Phase α): causal-truncated single-token decode.
 
-        Like ``decode_request`` but only attends over state K/V at positions strictly
-        less than ``max_position_exclusive``. Used for spec-verify multi-token batches.
-        Phase β step 2a: per-head Python loop replaced with batched torch attention
-        (sinks + window dense in single matmul across all heads; middle range still
-        per-head until Triton kernel rewrite).
+        ``query`` shape ``[num_heads, head_dim]``. Returns ``[num_heads, head_dim]``.
         """
         sequence = self.sequences.get(request_id)
         if sequence is None:
             raise KeyError(f"Layer {self.layer_idx} has no KVTC state for request {request_id}.")
         return self._decode_all_heads(sequence, query, max_position_exclusive=max_position_exclusive)
+
+    def decode_request_batch(self, request_id: str, query: torch.Tensor, global_pos_base: int) -> torch.Tensor:
+        """PATCH(lna-lab Phase β step 2c-lite): batched multi-token causal decode.
+
+        ``query`` shape ``[M, num_heads, head_dim]`` where M is the spec-verify batch
+        size. Each token i attends causally over state positions strictly less than
+        ``global_pos_base + i``. Returns ``[M, num_heads, head_dim]``.
+
+        Implemented as a Python loop over M with the per-token state slicing reused;
+        the heavy work (PCA dequant + RoPE) inside ``_decode_all_heads`` is amortized
+        per group, so the dominant cost is ~M × dense-region matmul instead of M ×
+        full-pipeline. Future Phase β step 2c-full would push the M loop into the
+        Triton kernel for one launch per layer.
+        """
+        sequence = self.sequences.get(request_id)
+        if sequence is None:
+            raise KeyError(f"Layer {self.layer_idx} has no KVTC state for request {request_id}.")
+        M = int(query.shape[0])
+        out = torch.empty_like(query)
+        for i in range(M):
+            out[i] = self._decode_all_heads(
+                sequence, query[i],
+                max_position_exclusive=global_pos_base + i,
+            )
+        return out
 
     def _decode_all_heads(
         self,
@@ -1089,22 +1110,25 @@ def _kvtc_compute_attention(
     )
 
     for span in spans:
-        # Per-token: causal slice of state. We rely on the fact that this call's
-        # tokens were just appended to state at positions [seq_len-query_len .. seq_len-1].
-        # For each query token i (relative to span), attend over state truncated at
-        # absolute position seq_len - query_len + i (exclusive upper bound).
-        for i in range(span.query_len):
-            global_pos = span.seq_len - span.query_len + i
-            tok_idx = span.start + i
-            # decode_one_token_at_position computes attention over the per-request
-            # state truncated to positions < global_pos.
+        # PATCH(lna-lab Phase β step 2c-lite): batch the M=query_len verify tokens
+        # into a single decode call when M > 1. The state always grows by the M new
+        # tokens just captured; per-token causal slicing inside the batched
+        # decoder reuses the same dequantized K/V across all M queries.
+        if span.query_len > 1:
+            batch_q = q3d[span.start : span.start + span.query_len]                          # [M, num_heads, head_dim]
+            global_pos_base = span.seq_len - span.query_len
+            decoded_batch = state.decode_request_batch(
+                span.request_id, batch_q, global_pos_base,
+            )                                                                                 # [M, num_heads, head_dim]
+            out_3d[span.start : span.start + span.query_len] = decoded_batch
+        else:
+            global_pos = span.seq_len - 1
+            tok_idx = span.start
             decoded = state.decode_request_at(span.request_id, q3d[tok_idx], global_pos)
             out_3d[tok_idx] = decoded
 
-    # Reshape back to vLLM's 2D output layout.
     hidden = state.num_heads * state.head_dim
-    result = out_3d.reshape(num_tokens, hidden)
-    return result
+    return out_3d.reshape(num_tokens, hidden)
 
 
 def free_kv_cache(model_or_handle: Any) -> KVTCHandle:
