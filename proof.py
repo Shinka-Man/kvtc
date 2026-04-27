@@ -120,6 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-ms", type=int, default=50)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--no-triton", action="store_true")
+    parser.add_argument("--auto-activate", action="store_true",
+                        help="Activate KVTC decode path after prefill (default: passthrough).")
     parser.add_argument("--output-json", default="")
     return parser
 
@@ -130,8 +132,16 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     except ImportError as exc:  # pragma: no cover - only hit outside vLLM environments.
         raise RuntimeError("vLLM is not installed in this environment.") from exc
 
-    from src.calibrate_vllm import DEFAULT_WARMUP_PROMPTS, VLLMCalibrationCollector, calibrate_vllm_model
-    from src.vllm_backend import hook_model
+    from kvtc.calibrate_vllm import DEFAULT_WARMUP_PROMPTS, VLLMCalibrationCollector, calibrate_vllm_model
+    from kvtc.vllm_backend import hook_engine, free_kv_cache_engine
+
+    class _EngineHookProxy:
+        """Shim mimicking KVTCHandle for the proof.py reporting code (vLLM 0.19+ MP variant)."""
+        def __init__(self, info):
+            self.info = info or {}
+            self.active = bool(self.info.get("auto_activate", False))
+            self.free_timestamp = None
+            self.num_layers = int(self.info.get("num_layers", 0))
 
     llm = LLM(
         model=args.model,
@@ -140,6 +150,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         enforce_eager=args.enforce_eager,
+        async_scheduling=False,
+        enable_prefix_caching=False,
     )
 
     sampling_params = SamplingParams(
@@ -165,7 +177,11 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         calibration.sink_tokens = args.sink_tokens
         calibration.window_tokens = args.window_tokens
         calibration_entries = len(calibration.entries)
-        hook = hook_model(llm, calibration, auto_activate=True, use_triton=not args.no_triton)
+        # auto_activate disabled by default; pass --auto-activate to enable KVTC decode.
+        auto_act = bool(getattr(args, "auto_activate", False))
+        hook_info = hook_engine(llm, calibration, auto_activate=auto_act, use_triton=not args.no_triton)
+        print(f"[KVTC HOOK INSTALL] {hook_info}", flush=True)
+        hook = _EngineHookProxy(hook_info)
 
     llm.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=1), use_tqdm=False)
 
